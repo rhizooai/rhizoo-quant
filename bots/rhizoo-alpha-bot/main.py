@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+import sys
+
+# --- Activation Guard ---
+# Prevent running outside a virtual environment to avoid polluting system Python.
+if sys.prefix == sys.base_prefix:
+    print(
+        "\n[ERROR] Virtual environment is not active.\n"
+        "Run the setup script first, then activate:\n"
+        "  bash setup.sh && source .venv/bin/activate\n"
+    )
+    sys.exit(1)
+
 import asyncio
 
 from core.logger import logger
