@@ -16,29 +16,78 @@ if sys.prefix == sys.base_prefix:
 
 import asyncio
 import signal
+import time
 
 from core.logger import logger
 from core.exchange_client import ExchangeClient, ExchangeConfig
 from core.risk_manager import RiskManager
-from data.processor import DataBuffer
+from data.processor import ImbalanceTracker, MarketMetrics
 from strategies.liquidity_sweep import LiquiditySweepStrategy
+
+PULSE_INTERVAL_SEC = 5.0
+
+
+def _nofi_label(nofi: float) -> str:
+    abs_n = abs(nofi)
+    direction = "Buy" if nofi > 0 else "Sell"
+    if abs_n >= 0.7:
+        return f"Strong {direction} Bias"
+    if abs_n >= 0.3:
+        return f"Moderate {direction} Bias"
+    return "Balanced"
+
+
+def _vol_label(zscore: float) -> str:
+    if zscore >= 3.0:
+        return "EXTREME"
+    if zscore >= 2.0:
+        return "HEAVY"
+    if zscore >= 1.0:
+        return "ELEVATED"
+    return "NORMAL"
+
+
+def _eff_label(efficiency: float) -> str:
+    abs_e = abs(efficiency)
+    if abs_e >= 0.01:
+        return "Clear Path"
+    if abs_e >= 0.001:
+        return "Moderate"
+    return "Stalled / Absorbed"
+
+
+def _print_pulse(m: MarketMetrics) -> None:
+    logger.info(
+        f"\n--- RHIZOO ALPHA PULSE ---\n"
+        f"Trend:            {m.trend}\n"
+        f"nOFI:             {m.nofi:+.4f} ({_nofi_label(m.nofi)})\n"
+        f"Volume Intensity: {m.volume_zscore:.1f} sigma ({_vol_label(m.volume_zscore)})\n"
+        f"Efficiency:       {m.efficiency:+.6f} ({_eff_label(m.efficiency)})\n"
+        f"Absorption:       {'YES' if m.is_absorption else 'NO'}\n"
+        f"Status:           {m.status}\n"
+        f"--------------------------"
+    )
 
 
 async def run() -> None:
-    """Long-running coroutine: streams trades and drives strategy evaluation."""
+    """Long-running coroutine: streams trades, computes imbalance metrics, drives strategy."""
     symbol = "BTC/USDT"
 
     client = ExchangeClient(ExchangeConfig(sandbox=True))
     risk = RiskManager()
-    buffer = DataBuffer()
+    tracker = ImbalanceTracker()
     strategy = LiquiditySweepStrategy()
 
     logger.info(f"Rhizoo Alpha Bot starting — streaming {symbol}")
 
+    last_pulse = 0.0
+
     try:
         async for trades in client.stream_trades(symbol):
-            buffer.push(trades)
-            logger.debug(f"Buffer: {buffer.size} trades (batch of {len(trades)})")
+            tracker.push(trades)
+
+            metrics = tracker.compute_metrics()
+            risk.update_metrics(metrics)
 
             for trade in trades:
                 await strategy.on_data(trade)
@@ -51,6 +100,12 @@ async def run() -> None:
                     await strategy.execute(signal_result)
                 else:
                     logger.warning(f"Signal rejected by RiskManager: {signal_result}")
+
+            # Pulse dashboard — every 5 seconds when market is not idle
+            now = time.monotonic()
+            if now - last_pulse >= PULSE_INTERVAL_SEC and tracker.size > 0:
+                _print_pulse(metrics)
+                last_pulse = now
 
     except asyncio.CancelledError:
         logger.info("Run loop cancelled — shutting down")
