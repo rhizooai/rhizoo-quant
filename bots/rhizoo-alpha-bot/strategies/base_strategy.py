@@ -12,6 +12,16 @@ class StrategyConfig(BaseModel):
     timeframe: str = Field(default="5m", description="Candle timeframe")
 
 
+class TradeSignal(BaseModel):
+    """Structured signal emitted by a strategy — consumed by RiskManager."""
+
+    side: str = Field(..., description="'buy' or 'sell'")
+    strength: str = Field(default="MEDIUM", description="HIGH / MEDIUM / LOW")
+    reason: str = Field(default="")
+    price: float = Field(default=0.0)
+    timestamp_ms: float = Field(default=0.0)
+
+
 class BaseStrategy(ABC):
     """Abstract base class for all trading strategies."""
 
@@ -24,11 +34,14 @@ class BaseStrategy(ABC):
         ...
 
     @abstractmethod
-    async def generate_signal(self) -> str | None:
-        """Evaluate conditions and return a signal ('buy', 'sell') or None."""
+    async def generate_signal(self, metrics: Any) -> TradeSignal | None:
+        """Evaluate conditions and return a TradeSignal or None.
+
+        *metrics* is a MarketMetrics instance from the ImbalanceTracker.
+        """
         ...
 
     @abstractmethod
-    async def execute(self, signal: str) -> None:
+    async def execute(self, signal: TradeSignal) -> None:
         """Execute a trade based on the signal."""
         ...

@@ -18,8 +18,8 @@ class RiskConfig(BaseModel):
 class RiskManager:
     """Risk management gate.
 
-    Receives MarketMetrics from the ImbalanceTracker so it can eventually
-    enforce circuit-breaker rules when volatility spikes.
+    Receives MarketMetrics from the ImbalanceTracker so it can enforce
+    circuit-breaker rules when volatility spikes.
     """
 
     def __init__(self, config: RiskConfig | None = None) -> None:
@@ -41,8 +41,8 @@ class RiskManager:
                 logger.info("Circuit breaker released — resuming normal operation")
             self._halted = False
 
-    async def evaluate(self, signal: str, market_data: dict[str, Any]) -> bool:
-        """Return True if the signal passes risk checks."""
+    async def evaluate(self, signal: Any, market_data: dict[str, Any]) -> bool:
+        """Return True if the TradeSignal passes risk checks."""
         if self._halted:
             return False
         # TODO: implement position sizing, drawdown checks, exposure limits

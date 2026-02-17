@@ -21,7 +21,7 @@ import time
 from core.logger import logger
 from core.exchange_client import ExchangeClient, ExchangeConfig
 from core.risk_manager import RiskManager
-from data.processor import ImbalanceTracker, MarketMetrics
+from data.processor import ImbalanceTracker, LevelInfo, MarketMetrics
 from strategies.liquidity_sweep import LiquiditySweepStrategy
 
 PULSE_INTERVAL_SEC = 5.0
@@ -56,7 +56,7 @@ def _eff_label(efficiency: float) -> str:
     return "Stalled / Absorbed"
 
 
-def _print_pulse(m: MarketMetrics) -> None:
+def _print_pulse(m: MarketMetrics, lv: LevelInfo) -> None:
     logger.info(
         f"\n--- RHIZOO ALPHA PULSE ---\n"
         f"Trend:            {m.trend}\n"
@@ -64,13 +64,17 @@ def _print_pulse(m: MarketMetrics) -> None:
         f"Volume Intensity: {m.volume_zscore:.1f} sigma ({_vol_label(m.volume_zscore)})\n"
         f"Efficiency:       {m.efficiency:+.6f} ({_eff_label(m.efficiency)})\n"
         f"Absorption:       {'YES' if m.is_absorption else 'NO'}\n"
+        f"Nearest High:     {lv.nearest_high:.1f} (Dist: {lv.high_distance_pct:.1f}%)\n"
+        f"Nearest Low:      {lv.nearest_low:.1f} (Dist: {lv.low_distance_pct:.1f}%)\n"
+        f"ATR:              {lv.atr:.2f}\n"
+        f"Sweep Status:     {lv.sweep_status}\n"
         f"Status:           {m.status}\n"
         f"--------------------------"
     )
 
 
 async def run() -> None:
-    """Long-running coroutine: streams trades, computes imbalance metrics, drives strategy."""
+    """Long-running coroutine: streams trades, computes metrics, drives strategy."""
     symbol = "BTC/USDT"
 
     client = ExchangeClient(ExchangeConfig(sandbox=True))
@@ -92,19 +96,20 @@ async def run() -> None:
             for trade in trades:
                 await strategy.on_data(trade)
 
-            signal_result = await strategy.generate_signal()
+            signal_result = await strategy.generate_signal(metrics)
             if signal_result:
                 market = trades[-1] if trades else {}
                 if await risk.evaluate(signal_result, market):
-                    logger.info(f"Signal approved: {signal_result}")
+                    logger.info(f"Signal approved: {signal_result.side.upper()} strength={signal_result.strength}")
                     await strategy.execute(signal_result)
                 else:
-                    logger.warning(f"Signal rejected by RiskManager: {signal_result}")
+                    logger.warning(f"Signal rejected by RiskManager: {signal_result.side}")
 
             # Pulse dashboard — every 5 seconds when market is not idle
             now = time.monotonic()
             if now - last_pulse >= PULSE_INTERVAL_SEC and tracker.size > 0:
-                _print_pulse(metrics)
+                level_info = strategy.levels.level_info()
+                _print_pulse(metrics, level_info)
                 last_pulse = now
 
     except asyncio.CancelledError:
