@@ -37,17 +37,28 @@ class LiquiditySweepStrategy(BaseStrategy):
             return None
 
         side, strength = result
+        info = self.levels.level_info()
+
+        # Stop-loss: just beyond the swept level (the liquidity zone edge)
+        atr_buf = info.atr * self.levels.config.atr_buffer_mult
+        if side == "buy":
+            stop_loss = info.nearest_low - atr_buf
+        else:
+            stop_loss = info.nearest_high + atr_buf
+
         return TradeSignal(
             side=side,
             strength=strength,
             reason=f"liquidity_sweep nOFI={m.nofi:+.4f}",
             price=self._last_price,
+            stop_loss=round(stop_loss, 2),
             timestamp_ms=time.time() * 1000,
         )
 
-    async def execute(self, signal: TradeSignal) -> None:
+    async def execute(self, order: Any) -> None:
         # TODO: place orders via exchange client
         logger.info(
-            f"[EXEC] {signal.side.upper()} @ {signal.price:.2f} "
-            f"strength={signal.strength} reason={signal.reason}"
+            f"[EXEC] {order.side.upper()} {order.position_size:.6f} "
+            f"@ {order.entry_price:.2f} | SL={order.stop_loss:.2f} "
+            f"TP={order.take_profit:.2f} | {order.reason}"
         )

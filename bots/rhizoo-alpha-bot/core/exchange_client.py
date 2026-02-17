@@ -61,6 +61,11 @@ class ExchangeClient:
             "volume": ticker["baseVolume"],
         }
 
+    async def get_bid_ask(self, symbol: str = "BTC/USDT") -> tuple[float, float]:
+        """Fetch current best bid and ask prices via REST."""
+        ticker = await self.exchange.fetch_ticker(symbol)
+        return float(ticker["bid"]), float(ticker["ask"])
+
     async def stream_trades(self, symbol: str = "BTC/USDT") -> AsyncIterator[list[dict[str, Any]]]:
         """Persistent WebSocket trade stream with exponential backoff reconnection.
 

@@ -96,14 +96,15 @@ async def run() -> None:
             for trade in trades:
                 await strategy.on_data(trade)
 
-            signal_result = await strategy.generate_signal(metrics)
-            if signal_result:
-                market = trades[-1] if trades else {}
-                if await risk.evaluate(signal_result, market):
-                    logger.info(f"Signal approved: {signal_result.side.upper()} strength={signal_result.strength}")
-                    await strategy.execute(signal_result)
+            # Strategy → Signal → RiskManager Gatekeeper → ValidatedOrder
+            trade_signal = await strategy.generate_signal(metrics)
+            if trade_signal:
+                bid, ask = await client.get_bid_ask(symbol)
+                order = risk.process_signal(trade_signal, bid, ask)
+                if order:
+                    await strategy.execute(order)
                 else:
-                    logger.warning(f"Signal rejected by RiskManager: {signal_result.side}")
+                    logger.debug(f"Signal filtered by RiskManager: {trade_signal.side}")
 
             # Pulse dashboard — every 5 seconds when market is not idle
             now = time.monotonic()

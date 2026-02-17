@@ -19,6 +19,7 @@ class TradeSignal(BaseModel):
     strength: str = Field(default="MEDIUM", description="HIGH / MEDIUM / LOW")
     reason: str = Field(default="")
     price: float = Field(default=0.0)
+    stop_loss: float = Field(default=0.0, description="Suggested stop-loss price")
     timestamp_ms: float = Field(default=0.0)
 
 
@@ -42,6 +43,6 @@ class BaseStrategy(ABC):
         ...
 
     @abstractmethod
-    async def execute(self, signal: TradeSignal) -> None:
-        """Execute a trade based on the signal."""
+    async def execute(self, order: Any) -> None:
+        """Execute a validated order."""
         ...
