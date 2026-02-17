@@ -20,7 +20,9 @@ class TradeSignal(BaseModel):
     reason: str = Field(default="")
     price: float = Field(default=0.0)
     stop_loss: float = Field(default=0.0, description="Suggested stop-loss price")
+    take_profit: float = Field(default=0.0, description="Suggested take-profit price")
     timestamp_ms: float = Field(default=0.0)
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Strategy-specific data")
 
 
 class BaseStrategy(ABC):

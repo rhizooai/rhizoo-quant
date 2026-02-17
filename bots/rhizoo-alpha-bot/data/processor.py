@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -36,12 +37,14 @@ class ImbalanceConfig(BaseModel):
 
 class LevelConfig(BaseModel):
     candle_interval_sec: float = Field(default=60.0, description="Candle synthesis interval (seconds)")
-    candle_window: int = Field(default=200, description="Rolling candle count for level detection")
+    candle_window: int = Field(default=240, description="Rolling candle count (4h of 1m candles)")
+    h1_lookback: int = Field(default=60, description="Candles for H1 extremes")
     atr_period: int = Field(default=14, description="ATR lookback period")
-    atr_buffer_mult: float = Field(default=0.1, description="ATR multiplier for liquidity zone")
-    snap_back_sec: float = Field(default=30.0, description="Max time for price to snap back after sweep")
-    nofi_threshold: float = Field(default=0.75, description="Minimum |nOFI| to confirm a sweep")
-    cooldown_sec: float = Field(default=300.0, description="Cooldown after a sweep signal (seconds)")
+    buffer_zone_pct: float = Field(default=0.0005, description="0.05% buffer around levels")
+    nofi_threshold: float = Field(default=0.7, description="Minimum |nOFI| to confirm a sweep")
+    sweep_timeout_sec: float = Field(default=60.0, description="Max time in SWEEPING state")
+    confirm_timeout_sec: float = Field(default=30.0, description="Max time in CONFIRMING state")
+    cooldown_sec: float = Field(default=1800.0, description="Per-level cooldown after signal (30 min)")
 
 
 # ---------------------------------------------------------------------------
@@ -62,17 +65,34 @@ class MarketMetrics(BaseModel):
 
 
 class LevelInfo(BaseModel):
-    nearest_high: float = Field(default=0.0)
-    nearest_low: float = Field(default=0.0)
-    high_distance_pct: float = Field(default=0.0)
-    low_distance_pct: float = Field(default=0.0)
+    h1_high: float = Field(default=0.0)
+    h1_low: float = Field(default=0.0)
+    h4_high: float = Field(default=0.0)
+    h4_low: float = Field(default=0.0)
+    h1_high_dist_pct: float = Field(default=0.0)
+    h1_low_dist_pct: float = Field(default=0.0)
+    h4_high_dist_pct: float = Field(default=0.0)
+    h4_low_dist_pct: float = Field(default=0.0)
     atr: float = Field(default=0.0)
-    sweep_status: str = Field(default="SCANNING")
     current_price: float = Field(default=0.0)
+    near_liquidity: str = Field(default="NONE", description="Level name we're near, or NONE")
+    hunt_summary: str = Field(default="SCANNING", description="Aggregate hunt status")
+
+
+class SweepResult(BaseModel):
+    """Emitted when a sweep is confirmed."""
+    side: str = Field(..., description="'buy' or 'sell'")
+    strength: str = Field(default="HIGH")
+    level_name: str = Field(..., description="e.g. 'H4_Low'")
+    level_price: float
+    wick_extreme: float = Field(..., description="Furthest sweep point (the stop-loss)")
+    fib_tp: float = Field(..., description="0.5 Fibonacci TP of the range")
+    range_high: float
+    range_low: float
 
 
 # ---------------------------------------------------------------------------
-# ImbalanceTracker (unchanged)
+# ImbalanceTracker
 # ---------------------------------------------------------------------------
 
 
@@ -239,21 +259,38 @@ class ImbalanceTracker:
 
 
 # ---------------------------------------------------------------------------
-# LevelTracker — candle synthesis, local high/low, ATR, sweep detection
+# LevelTracker — multi-timeframe liquidity levels + Hunter state machine
 # ---------------------------------------------------------------------------
 
 # Candle columns: [open, high, low, close, volume, timestamp_ms_open]
 _O, _H, _L, _C, _V, _T = 0, 1, 2, 3, 4, 5
 
+# Hunt states
+_SCANNING = "SCANNING"
+_SWEEPING = "SWEEPING"
+_CONFIRMING = "CONFIRMING"
+_COOLDOWN = "COOLDOWN"
+
+
+@dataclass
+class _HuntState:
+    """Per-level sweep state machine."""
+    name: str
+    is_high: bool  # True = tracking a high level, False = low level
+    state: str = _SCANNING
+    level_price: float = 0.0
+    opposite_price: float = 0.0
+    wick_extreme: float = 0.0
+    sweep_start: float = 0.0
+    cooldown_until: float = 0.0
+
 
 class LevelTracker:
-    """Tracks liquidity levels from synthesised candles and detects sweep events."""
+    """Multi-timeframe liquidity level tracker with per-level Hunter state machines.
 
-    # Sweep state machine
-    _STATE_SCANNING = "SCANNING"
-    _STATE_SWEEP_LOW = "SWEEP_LOW"
-    _STATE_SWEEP_HIGH = "SWEEP_HIGH"
-    _STATE_COOLDOWN = "COOLDOWN"
+    Synthesises 1-min candles from the trade stream, computes H1/H4 extremes,
+    and runs SCANNING → SWEEPING → CONFIRMING per level.
+    """
 
     def __init__(self, config: LevelConfig | None = None) -> None:
         self.config = config or LevelConfig()
@@ -263,26 +300,33 @@ class LevelTracker:
         self._candle_open_ts: float = 0.0
 
         self._current_price: float = 0.0
-        self._local_high: float = 0.0
-        self._local_low: float = 0.0
         self._atr: float = 0.0
 
-        # Sweep state
-        self._state: str = self._STATE_SCANNING
-        self._sweep_start_time: float = 0.0
-        self._cooldown_start: float = 0.0
+        # Multi-timeframe levels
+        self._h1_high: float = 0.0
+        self._h1_low: float = 0.0
+        self._h4_high: float = 0.0
+        self._h4_low: float = 0.0
+
+        # Per-level hunt states
+        self._hunts: dict[str, _HuntState] = {
+            "H1_High": _HuntState(name="H1_High", is_high=True),
+            "H1_Low":  _HuntState(name="H1_Low",  is_high=False),
+            "H4_High": _HuntState(name="H4_High", is_high=True),
+            "H4_Low":  _HuntState(name="H4_Low",  is_high=False),
+        }
 
         logger.info(
             f"LevelTracker initialized "
             f"(window={self.config.candle_window} candles, "
-            f"atr_period={self.config.atr_period}, "
+            f"H1={self.config.h1_lookback}, "
+            f"buffer={self.config.buffer_zone_pct:.4%}, "
             f"cooldown={self.config.cooldown_sec}s)"
         )
 
     # -- candle synthesis --------------------------------------------------
 
     def _bucket_ts(self, ts_ms: float) -> float:
-        """Floor timestamp to the candle interval boundary."""
         interval_ms = self.config.candle_interval_sec * 1000
         return (ts_ms // interval_ms) * interval_ms
 
@@ -296,11 +340,9 @@ class LevelTracker:
         bucket = self._bucket_ts(ts)
 
         if self._current_candle is None or bucket != self._candle_open_ts:
-            # Finalise previous candle
             if self._current_candle is not None:
                 self._candles.append(self._current_candle.copy())
                 self._recompute_levels()
-            # Start new candle
             self._current_candle = np.array(
                 [price, price, price, price, amount, bucket], dtype=np.float64
             )
@@ -315,119 +357,248 @@ class LevelTracker:
     # -- level computation -------------------------------------------------
 
     def _recompute_levels(self) -> None:
-        """Recompute local high/low and ATR from finalised candles."""
-        if len(self._candles) < 2:
+        """Recompute H1/H4 extremes and ATR from finalised candles."""
+        n = len(self._candles)
+        if n < 2:
             return
 
-        candles = np.array(self._candles, dtype=np.float64)
-        highs = candles[:, _H]
-        lows = candles[:, _L]
-        closes = candles[:, _C]
+        all_candles = np.array(self._candles, dtype=np.float64)
 
-        self._local_high = float(np.max(highs))
-        self._local_low = float(np.min(lows))
+        # H4 = full window
+        self._h4_high = float(np.max(all_candles[:, _H]))
+        self._h4_low = float(np.min(all_candles[:, _L]))
+
+        # H1 = last h1_lookback candles
+        h1_slice = all_candles[-min(self.config.h1_lookback, n):]
+        self._h1_high = float(np.max(h1_slice[:, _H]))
+        self._h1_low = float(np.min(h1_slice[:, _L]))
+
+        # Update hunt level prices (only for SCANNING state — don't move active hunts)
+        level_map = {
+            "H1_High": (self._h1_high, self._h1_low),
+            "H1_Low":  (self._h1_low, self._h1_high),
+            "H4_High": (self._h4_high, self._h4_low),
+            "H4_Low":  (self._h4_low, self._h4_high),
+        }
+        for name, (lvl, opp) in level_map.items():
+            h = self._hunts[name]
+            if h.state == _SCANNING:
+                h.level_price = lvl
+                h.opposite_price = opp
 
         # ATR
-        n = min(self.config.atr_period, len(candles))
-        recent = candles[-n:]
-        if n >= 2:
+        atr_n = min(self.config.atr_period, n)
+        recent = all_candles[-atr_n:]
+        if atr_n >= 2:
             h = recent[:, _H]
             l = recent[:, _L]
             prev_c = np.empty_like(h)
             prev_c[0] = recent[0, _O]
             prev_c[1:] = recent[:-1, _C]
-
             tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
             self._atr = float(np.mean(tr))
 
-    # -- sweep detection ---------------------------------------------------
+    # -- Hunter state machine (per-level) ----------------------------------
 
-    def check_sweep(self, nofi: float) -> tuple[str, str] | None:
-        """Evaluate the sweep state machine.
+    def check_hunt(self, nofi: float) -> SweepResult | None:
+        """Run the Hunter state machine for all tracked levels.
 
-        Returns (side, strength) if a valid sweep signal fires, else None.
-        Sides: "buy" (bearish sweep confirmed) or "sell" (bullish sweep confirmed).
+        Returns a SweepResult on the first confirmed signal, or None.
         """
-        if self._local_high == 0.0 or self._local_low == 0.0 or self._current_price == 0.0:
+        if self._current_price == 0.0:
             return None
 
         now = time.time()
-        buf = self._atr * self.config.atr_buffer_mult
+        price = self._current_price
+        buf = price * self.config.buffer_zone_pct
+
+        for h in self._hunts.values():
+            if h.level_price == 0.0:
+                continue
+
+            result = self._tick_hunt(h, price, buf, nofi, now)
+            if result is not None:
+                return result
+
+        return None
+
+    def _tick_hunt(
+        self,
+        h: _HuntState,
+        price: float,
+        buf: float,
+        nofi: float,
+        now: float,
+    ) -> SweepResult | None:
 
         # --- COOLDOWN ---
-        if self._state == self._STATE_COOLDOWN:
-            if now - self._cooldown_start >= self.config.cooldown_sec:
-                self._state = self._STATE_SCANNING
-                logger.info("Sweep cooldown expired — back to SCANNING")
+        if h.state == _COOLDOWN:
+            if now >= h.cooldown_until:
+                h.state = _SCANNING
+                logger.debug(f"[HUNT] {h.name} cooldown expired — SCANNING")
             return None
 
-        # --- SWEEP_LOW: waiting for snap-back + buy imbalance ---
-        if self._state == self._STATE_SWEEP_LOW:
-            elapsed = now - self._sweep_start_time
-            if elapsed > self.config.snap_back_sec:
-                logger.debug("Sweep LOW timed out — back to SCANNING")
-                self._state = self._STATE_SCANNING
-            elif self._current_price > self._local_low and nofi >= self.config.nofi_threshold:
-                self._state = self._STATE_COOLDOWN
-                self._cooldown_start = now
-                logger.info(
-                    f"BEARISH SWEEP CONFIRMED at {self._current_price:.2f} "
-                    f"(nOFI={nofi:+.2f}) → BUY"
-                )
-                return ("buy", "HIGH")
-            return None
+        # --- CONFIRMING ---
+        if h.state == _CONFIRMING:
+            elapsed = now - h.sweep_start
+            total_timeout = self.config.sweep_timeout_sec + self.config.confirm_timeout_sec
+            if elapsed > total_timeout:
+                logger.debug(f"[HUNT] {h.name} CONFIRMING timed out — SCANNING")
+                h.state = _SCANNING
+                return None
 
-        # --- SWEEP_HIGH: waiting for snap-back + sell imbalance ---
-        if self._state == self._STATE_SWEEP_HIGH:
-            elapsed = now - self._sweep_start_time
-            if elapsed > self.config.snap_back_sec:
-                logger.debug("Sweep HIGH timed out — back to SCANNING")
-                self._state = self._STATE_SCANNING
-            elif self._current_price < self._local_high and nofi <= -self.config.nofi_threshold:
-                self._state = self._STATE_COOLDOWN
-                self._cooldown_start = now
+            # Check if price left the zone again → back to SWEEPING
+            if h.is_high and price > h.level_price + buf:
+                h.state = _SWEEPING
+                h.wick_extreme = max(h.wick_extreme, price)
+                return None
+            if not h.is_high and price < h.level_price - buf:
+                h.state = _SWEEPING
+                h.wick_extreme = min(h.wick_extreme, price)
+                return None
+
+            # Check nOFI confirmation
+            if h.is_high and nofi <= -self.config.nofi_threshold:
+                # Bullish sweep confirmed → SELL
+                h.state = _COOLDOWN
+                h.cooldown_until = now + self.config.cooldown_sec
                 logger.info(
-                    f"BULLISH SWEEP CONFIRMED at {self._current_price:.2f} "
+                    f"[HUNT] CONFIRMED {h.name} sweep at {price:.2f} "
                     f"(nOFI={nofi:+.2f}) → SELL"
                 )
-                return ("sell", "HIGH")
+                return self._build_result(h, "sell", price)
+
+            if not h.is_high and nofi >= self.config.nofi_threshold:
+                # Bearish sweep confirmed → BUY
+                h.state = _COOLDOWN
+                h.cooldown_until = now + self.config.cooldown_sec
+                logger.info(
+                    f"[HUNT] CONFIRMED {h.name} sweep at {price:.2f} "
+                    f"(nOFI={nofi:+.2f}) → BUY"
+                )
+                return self._build_result(h, "buy", price)
+
             return None
 
-        # --- SCANNING: look for a new sweep ---
-        if self._current_price < self._local_low - buf:
-            self._state = self._STATE_SWEEP_LOW
-            self._sweep_start_time = now
+        # --- SWEEPING ---
+        if h.state == _SWEEPING:
+            elapsed = now - h.sweep_start
+            if elapsed > self.config.sweep_timeout_sec:
+                logger.debug(f"[HUNT] {h.name} SWEEPING timed out — SCANNING")
+                h.state = _SCANNING
+                return None
+
+            # Track wick extreme
+            if h.is_high:
+                h.wick_extreme = max(h.wick_extreme, price)
+            else:
+                h.wick_extreme = min(h.wick_extreme, price)
+
+            # Check snap-back: price returned inside the level
+            if h.is_high and price < h.level_price:
+                h.state = _CONFIRMING
+                logger.info(
+                    f"[HUNT] {h.name} price snapped back inside ({price:.2f} < "
+                    f"{h.level_price:.2f}). Waiting for Imbalance..."
+                )
+            elif not h.is_high and price > h.level_price:
+                h.state = _CONFIRMING
+                logger.info(
+                    f"[HUNT] {h.name} price snapped back inside ({price:.2f} > "
+                    f"{h.level_price:.2f}). Waiting for Imbalance..."
+                )
+
+            return None
+
+        # --- SCANNING ---
+        if h.is_high and price > h.level_price + buf:
+            h.state = _SWEEPING
+            h.sweep_start = now
+            h.wick_extreme = price
             logger.info(
-                f"Sweep LOW triggered — price {self._current_price:.2f} "
-                f"crossed below {self._local_low:.2f} (buf={buf:.2f})"
+                f"[HUNT] Potential Bullish sweep detected at {h.name} "
+                f"({h.level_price:.2f}). Price={price:.2f}. Waiting for Imbalance..."
             )
-        elif self._current_price > self._local_high + buf:
-            self._state = self._STATE_SWEEP_HIGH
-            self._sweep_start_time = now
+        elif not h.is_high and price < h.level_price - buf:
+            h.state = _SWEEPING
+            h.sweep_start = now
+            h.wick_extreme = price
             logger.info(
-                f"Sweep HIGH triggered — price {self._current_price:.2f} "
-                f"crossed above {self._local_high:.2f} (buf={buf:.2f})"
+                f"[HUNT] Potential Bearish sweep detected at {h.name} "
+                f"({h.level_price:.2f}). Price={price:.2f}. Waiting for Imbalance..."
             )
 
         return None
 
+    def _build_result(self, h: _HuntState, side: str, price: float) -> SweepResult:
+        """Build a SweepResult with Fibonacci TP."""
+        range_high = max(h.level_price, h.opposite_price)
+        range_low = min(h.level_price, h.opposite_price)
+        fib_50 = range_low + 0.5 * (range_high - range_low)
+
+        return SweepResult(
+            side=side,
+            strength="HIGH",
+            level_name=h.name,
+            level_price=round(h.level_price, 2),
+            wick_extreme=round(h.wick_extreme, 2),
+            fib_tp=round(fib_50, 2),
+            range_high=round(range_high, 2),
+            range_low=round(range_low, 2),
+        )
+
     # -- dashboard info ----------------------------------------------------
+
+    def _nearest_liquidity(self, price: float, buf: float) -> str:
+        """Return the name of the nearest level within the buffer zone, or NONE."""
+        levels = {
+            "H4_High": self._h4_high,
+            "H4_Low": self._h4_low,
+            "H1_High": self._h1_high,
+            "H1_Low": self._h1_low,
+        }
+        # Prefer H4 over H1 (higher-timeframe = stronger liquidity)
+        for name, lvl in levels.items():
+            if lvl > 0 and abs(price - lvl) <= buf:
+                return name
+        return "NONE"
+
+    def _hunt_summary(self) -> str:
+        """Aggregate hunt status for the dashboard."""
+        active = [
+            f"{h.name}:{h.state}"
+            for h in self._hunts.values()
+            if h.state not in (_SCANNING, _COOLDOWN)
+        ]
+        if active:
+            return " | ".join(active)
+        cooldowns = [h.name for h in self._hunts.values() if h.state == _COOLDOWN]
+        if cooldowns:
+            return f"COOLDOWN ({', '.join(cooldowns)})"
+        return "SCANNING"
 
     def level_info(self) -> LevelInfo:
         """Current level distances for the pulse dashboard."""
         price = self._current_price
-        if price == 0.0 or self._local_high == 0.0:
-            return LevelInfo(sweep_status=self._state)
+        if price == 0.0 or self._h4_high == 0.0:
+            return LevelInfo(hunt_summary=self._hunt_summary())
 
-        high_dist = (self._local_high - price) / price * 100
-        low_dist = (price - self._local_low) / price * 100
+        buf = price * self.config.buffer_zone_pct
+
+        def dist_pct(level: float) -> float:
+            return round((level - price) / price * 100, 3)
 
         return LevelInfo(
-            nearest_high=round(self._local_high, 2),
-            nearest_low=round(self._local_low, 2),
-            high_distance_pct=round(high_dist, 2),
-            low_distance_pct=round(low_dist, 2),
+            h1_high=round(self._h1_high, 2),
+            h1_low=round(self._h1_low, 2),
+            h4_high=round(self._h4_high, 2),
+            h4_low=round(self._h4_low, 2),
+            h1_high_dist_pct=dist_pct(self._h1_high),
+            h1_low_dist_pct=dist_pct(self._h1_low),
+            h4_high_dist_pct=dist_pct(self._h4_high),
+            h4_low_dist_pct=dist_pct(self._h4_low),
             atr=round(self._atr, 2),
-            sweep_status=self._state,
             current_price=round(price, 2),
+            near_liquidity=self._nearest_liquidity(price, buf),
+            hunt_summary=self._hunt_summary(),
         )
