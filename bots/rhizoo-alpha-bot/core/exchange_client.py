@@ -5,6 +5,7 @@ import os
 from collections.abc import AsyncIterator
 from typing import Any
 
+import ccxt
 import ccxt.pro as ccxtpro
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -49,6 +50,36 @@ class ExchangeClient:
         if self._exchange is None:
             self._exchange = self._create_exchange()
         return self._exchange
+
+    async def validate_symbol(self, symbol: str) -> str:
+        """Normalize and validate a trading symbol against the exchange.
+
+        Loads markets, uppercases the input, and checks it exists.
+        Returns the normalized symbol on success.
+        Raises SystemExit on invalid symbol (logs suggestions).
+        """
+        symbol = symbol.upper()
+        try:
+            await self.exchange.load_markets()
+        except (ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            logger.warning(f"Could not load markets for validation: {exc} — proceeding with {symbol}")
+            return symbol
+
+        if symbol in self.exchange.markets:
+            return symbol
+
+        # Build suggestions from available USDT pairs
+        available = sorted(self.exchange.markets.keys())
+        base = symbol.split("/")[0] if "/" in symbol else symbol
+        suggestions = [s for s in available if base in s][:10]
+        if not suggestions:
+            suggestions = [s for s in available if s.endswith("/USDT")][:10]
+
+        logger.error(
+            f"Symbol '{symbol}' not found on {self.config.exchange_id}. "
+            f"Suggestions: {', '.join(suggestions)}"
+        )
+        raise SystemExit(1)
 
     async def get_market_data(self, symbol: str = "BTC/USDT") -> dict[str, Any]:
         """Fetch current market data for a symbol via REST."""

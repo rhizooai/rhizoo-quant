@@ -14,6 +14,7 @@ if sys.prefix == sys.base_prefix:
     )
     sys.exit(1)
 
+import argparse
 import asyncio
 import os
 import signal
@@ -62,9 +63,11 @@ def _eff_label(efficiency: float) -> str:
     return "Stalled / Absorbed"
 
 
-def _print_pulse(m: MarketMetrics, lv: LevelInfo) -> None:
+def _print_pulse(m: MarketMetrics, lv: LevelInfo, symbol: str = "BTC/USDT") -> None:
+    header = f"RHIZOO ALPHA BOT | ACTIVE PAIR: {symbol}"
+    border = "=" * max(len(header) + 4, 50)
     logger.info(
-        f"\n--- RHIZOO ALPHA PULSE ---\n"
+        f"\n{border}\n  {header}\n{border}\n"
         f"Trend:            {m.trend}\n"
         f"nOFI:             {m.nofi:+.4f} ({_nofi_label(m.nofi)})\n"
         f"Volume Intensity: {m.volume_zscore:.1f} sigma ({_vol_label(m.volume_zscore)})\n"
@@ -169,44 +172,44 @@ async def _refresh_regime(
             logger.warning(f"[REGIME] Refresh failed: {exc} — using stale data")
 
 
-async def run() -> None:
+async def run(symbol: str) -> None:
     """Long-running coroutine: streams trades, computes metrics, drives strategy."""
-    symbol = "BTC/USDT"
-
     client = ExchangeClient(ExchangeConfig(sandbox=True))
-    risk = RiskManager()
-    tracker = ImbalanceTracker()
-    strategy = LiquiditySweepStrategy()
-
-    # Market regime — macro trend filter
-    regime = MarketRegime()
-    strategy.regime = regime
     refresh_task = None
-
-    try:
-        ohlcv_1h = await client.fetch_ohlcv(symbol, "1h", limit=200)
-        ohlcv_15m = await client.fetch_ohlcv(symbol, "15m", limit=200)
-        regime.load(ohlcv_1h, ohlcv_15m)
-        logger.info(
-            f"Market regime loaded — Trend: {regime.trend_1h}, "
-            f"ADX: {regime.adx_1h:.1f}, EMA200(1H): {regime.ema_200_1h:.2f}"
-        )
-        refresh_task = asyncio.create_task(_refresh_regime(client, regime, symbol))
-    except Exception as exc:
-        logger.warning(f"Failed to load market regime: {exc} — running without macro filter")
-
     paper_broker = None
-    position_monitor = None
-    if PAPER_TRADING:
-        paper_broker = PaperBroker(pair=symbol)
-        position_monitor = PositionMonitor(paper_broker)
-        logger.info("PAPER TRADING MODE ACTIVE")
-
-    logger.info(f"Rhizoo Alpha Bot starting — streaming {symbol}")
-
-    last_pulse = 0.0
 
     try:
+        symbol = await client.validate_symbol(symbol)
+        risk = RiskManager()
+        tracker = ImbalanceTracker()
+        strategy = LiquiditySweepStrategy()
+
+        # Market regime — macro trend filter
+        regime = MarketRegime()
+        strategy.regime = regime
+
+        try:
+            ohlcv_1h = await client.fetch_ohlcv(symbol, "1h", limit=200)
+            ohlcv_15m = await client.fetch_ohlcv(symbol, "15m", limit=200)
+            regime.load(ohlcv_1h, ohlcv_15m)
+            logger.info(
+                f"Market regime loaded — Trend: {regime.trend_1h}, "
+                f"ADX: {regime.adx_1h:.1f}, EMA200(1H): {regime.ema_200_1h:.2f}"
+            )
+            refresh_task = asyncio.create_task(_refresh_regime(client, regime, symbol))
+        except Exception as exc:
+            logger.warning(f"Failed to load market regime: {exc} — running without macro filter")
+
+        position_monitor = None
+        if PAPER_TRADING:
+            paper_broker = PaperBroker(pair=symbol)
+            position_monitor = PositionMonitor(paper_broker)
+            logger.info("PAPER TRADING MODE ACTIVE")
+
+        logger.info(f"Rhizoo Alpha Bot starting — streaming {symbol}")
+
+        last_pulse = 0.0
+
         async for trades in client.stream_trades(symbol):
             tracker.push(trades)
 
@@ -255,7 +258,7 @@ async def run() -> None:
             now = time.monotonic()
             if now - last_pulse >= PULSE_INTERVAL_SEC and tracker.size > 0:
                 level_info = strategy.levels.level_info()
-                _print_pulse(metrics, level_info)
+                _print_pulse(metrics, level_info, symbol)
                 _print_macro_context(regime)
                 if PAPER_TRADING:
                     _print_paper_stats(paper_broker.get_stats())
@@ -276,12 +279,24 @@ async def run() -> None:
         await client.close()
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Rhizoo Alpha Bot — liquidity sweep hunter")
+    parser.add_argument(
+        "-s", "--symbol",
+        default="BTC/USDT",
+        help="The trading pair to hunt (e.g., ETH/USDT, SOL/USDT).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Entry point: sets up the event loop with graceful shutdown."""
+    args = _parse_args()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    task = loop.create_task(run())
+    task = loop.create_task(run(args.symbol))
 
     def _shutdown(sig: signal.Signals) -> None:
         logger.info(f"Received {sig.name} — initiating graceful shutdown")
