@@ -1,63 +1,121 @@
 # Rhizoo Quant
 
-A decentralized, high-performance quantitative trading ecosystem.
+A modular monorepo for high-performance quantitative trading bots.
 
-## Vision
+## Active Bots
 
-Rhizoo Quant is a modular monorepo designed to house independent, high-frequency trading bots. Each bot operates as a self-contained execution unit with its own strategies, risk management, and exchange connectivity — while sharing common infrastructure and conventions across the ecosystem.
+| Bot | Description | Docs |
+|-----|-------------|------|
+| [rhizoo-alpha-bot](bots/rhizoo-alpha-bot/) | Liquidity sweep hunter with order flow confirmation, macro regime filter, and full risk management | [README](bots/rhizoo-alpha-bot/README.md) |
 
 ## Architecture
 
-This project follows a **monorepo** approach. The `bots/` directory contains independent execution units, each with its own dependencies, configuration, and deployment lifecycle. This allows:
-
-- **Isolation:** Each bot can be developed, tested, and deployed independently.
-- **Shared conventions:** Common patterns (logging, exchange clients, risk management) are consistent across bots.
-- **Scalability:** New bots can be scaffolded quickly by following the established structure.
+Each bot lives in `bots/` as a self-contained unit with its own strategies, dependencies, and configuration — while sharing credentials and conventions across the ecosystem.
 
 ```
 rhizoo-quant/
-├── .env.example
+├── .env.example          # Shared config template (credentials + global settings)
 ├── .gitignore
 ├── README.md
 └── bots/
-    └── <bot-name>/
-        ├── main.py
+    └── rhizoo-alpha-bot/
+        ├── main.py           # Entry point + event loop
+        ├── README.md         # Bot-specific documentation
         ├── requirements.txt
-        ├── core/          # Exchange clients, risk management, logging
-        ├── strategies/    # Trading strategy implementations
-        └── data/          # Data processing and math utilities
+        ├── setup.sh          # One-command environment setup
+        ├── core/             # Exchange clients, risk management, logging
+        ├── strategies/       # Trading strategy implementations
+        ├── data/             # Data processing, indicators, market regime
+        └── logs/             # Rotating logs + paper trade CSVs
 ```
 
-## Active Projects
+## Tech Stack
 
-| Bot | Status | Description |
-|-----|--------|-------------|
-| `rhizoo-alpha-bot` | Event-Driven | First trading engine — liquidity sweep strategy |
-
-## Flow of Execution
-
-```
-main.py
-  └─ run() coroutine
-       ├─ ExchangeClient.stream_trades(symbol)   ← persistent WebSocket via ccxt.pro
-       │     └─ watch_trades() loop with exponential backoff reconnection
-       ├─ DataBuffer.push(trades)                 ← fixed-size deque (last 1000 trades)
-       ├─ Strategy.on_data() → generate_signal()  ← evaluate on every tick batch
-       └─ RiskManager.evaluate()                  ← gate before order execution
-```
-
-The bot operates as a **persistent event loop**. On startup it opens a WebSocket connection to the exchange and continuously streams trades. Each batch is buffered, fed to the active strategy, and any resulting signals are validated through the risk manager before execution. Graceful shutdown is handled via `SIGINT`/`SIGTERM`.
-
-If the WebSocket connection drops, the client reconnects with **exponential backoff** (up to 5 retries, base 2s delay) before giving up.
+| Package | Version | Purpose |
+|---------|---------|---------|
+| [ccxt / ccxt.pro](https://github.com/ccxt/ccxt) | `>=4.0.0` | Exchange connectivity — unified REST + WebSocket API across 100+ exchanges. Powers live trade streaming (`watch_trades`), OHLCV fetching, market validation, and order execution. |
+| [NumPy](https://numpy.org/) | `>=1.24.0` | Vectorized math for all indicators — nOFI, ATR, volume Z-Score, EMA, ADX. Keeps per-tick latency under 10ms. |
+| [Pydantic](https://docs.pydantic.dev/) | `>=2.0.0` | Data validation and settings management. Every config, metric, signal, and order is a typed Pydantic model. |
+| [Loguru](https://github.com/Delgan/loguru) | `>=0.7.0` | Structured logging with colored console output + rotating file logs (10 MB, 7-day retention, gzip compression). |
+| [python-dotenv](https://github.com/theskumar/python-dotenv) | `>=1.0.0` | Two-layer `.env` loading — root credentials inherited by all bots, per-bot overrides take priority. |
 
 ## Getting Started
 
-1. Clone the repository.
-2. Copy `.env.example` to `.env` and fill in your API keys.
-3. Navigate to a bot directory (e.g., `bots/rhizoo-alpha-bot/`).
-4. Install dependencies: `pip install -r requirements.txt`
-5. Run: `python main.py`
+### 1. Clone and configure credentials
+
+```bash
+git clone <repo-url> && cd rhizoo-quant
+cp .env.example .env
+```
+
+Edit `.env` and fill in your exchange API keys. See [`.env.example`](.env.example) for a full reference on the two-layer configuration system.
+
+### 2. Set up a bot
+
+```bash
+cd bots/rhizoo-alpha-bot
+bash setup.sh            # Creates venv + installs dependencies
+source .venv/bin/activate
+```
+
+### 3. Run in paper trading mode (recommended first step)
+
+Make sure `PAPER_TRADING=true` is set in your `.env` (it is by default), then:
+
+```bash
+python main.py                  # Defaults to BTC/USDT
+python main.py -s ETH/USDT     # Hunt a different pair
+```
+
+The bot will stream live market data and simulate trades without risking real capital. Check `logs/simulated_trades_*.csv` for results.
+
+See the [Alpha Bot README](bots/rhizoo-alpha-bot/README.md) for detailed documentation on the strategy, risk management, market regime filter, and dashboard output.
+
+### 4. Go live
+
+When you're confident in the strategy's performance:
+
+```env
+PAPER_TRADING=false
+```
+
+Ensure your API keys have trading permissions and appropriate IP restrictions.
+
+## Environment Configuration
+
+The repo uses a **two-layer `.env` system**:
+
+1. **Root `.env`** (this directory) — Shared credentials and global settings. Every bot inherits these automatically via `python-dotenv`'s directory traversal.
+2. **Bot-level `.env`** (e.g. `bots/rhizoo-alpha-bot/.env`) — Optional per-bot overrides. Only set what you want to change; everything else falls through to root.
+
+| Variable | Default | Scope | Description |
+|----------|---------|-------|-------------|
+| `BINANCE_API_KEY` | — | Root | Exchange API key |
+| `BINANCE_SECRET` | — | Root | Exchange API secret |
+| `LOG_LEVEL` | `DEBUG` | Root | Logging verbosity |
+| `ACCOUNT_BALANCE` | `10000.0` | Bot | Account equity for position sizing |
+| `ZSCORE_THRESHOLD` | `2.0` | Bot | Volume Z-Score signal threshold |
+| `PAPER_TRADING` | `true` | Bot | Enable simulated execution |
+| `PAPER_BALANCE` | `10000.0` | Bot | Virtual starting balance |
+
+## Execution Flow
+
+```
+main.py → run(symbol)
+  │
+  ├─ ExchangeClient.validate_symbol()    ← Normalize + verify against exchange
+  ├─ MarketRegime.load()                 ← Fetch 1H/15m candles, compute EMA 200 + ADX
+  ├─ Background: _refresh_regime()       ← Re-fetch every 15 minutes
+  │
+  └─ WebSocket trade stream loop:
+       ├─ ImbalanceTracker.push()        ← nOFI, efficiency, volume Z-Score
+       ├─ LevelTracker.push_trade()      ← Candle synthesis, H1/H4 levels, ATR
+       ├─ Strategy.generate_signal()     ← Hunter state machine + regime filter
+       ├─ RiskManager.process_signal()   ← Sizing, circuit breakers, spread guard
+       └─ Execute (paper or live)
+```
 
 ## Requirements
 
 - Python 3.11+
+- Exchange API credentials (Binance testnet supported via sandbox mode)
