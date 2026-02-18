@@ -25,6 +25,7 @@ class LiquiditySweepStrategy(BaseStrategy):
         super().__init__(cfg)
         self.levels = LevelTracker(cfg.level_config)
         self._last_price: float = 0.0
+        self.regime: Any | None = None  # Set from main.py
 
     async def on_data(self, market_data: dict[str, Any]) -> None:
         """Feed each trade into the LevelTracker for candle synthesis."""
@@ -36,6 +37,14 @@ class LiquiditySweepStrategy(BaseStrategy):
         m: MarketMetrics = metrics
         result: SweepResult | None = self.levels.check_hunt(m.nofi)
         if result is None:
+            return None
+
+        # Macro trend filter
+        if self.regime is not None and not self.regime.is_signal_allowed(result.side):
+            logger.info(
+                f"[REGIME] Signal filtered: {result.side.upper()} against "
+                f"{self.regime.trend_1h} macro trend (ADX={self.regime.adx_1h:.0f})"
+            )
             return None
 
         return TradeSignal(

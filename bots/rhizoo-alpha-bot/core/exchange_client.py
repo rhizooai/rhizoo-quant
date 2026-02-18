@@ -101,6 +101,15 @@ class ExchangeClient:
                 logger.info(f"WebSocket stream for {symbol} cancelled")
                 raise
 
+    async def fetch_ohlcv(
+        self, symbol: str, timeframe: str, limit: int = 200
+    ) -> list[list]:
+        """Fetch historical OHLCV candles via REST.
+
+        Returns ccxt format: [[timestamp, open, high, low, close, volume], ...]
+        """
+        return await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+
     async def close(self) -> None:
         if self._exchange is not None:
             await self._exchange.close()

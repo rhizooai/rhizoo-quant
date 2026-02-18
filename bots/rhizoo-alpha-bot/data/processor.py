@@ -602,3 +602,250 @@ class LevelTracker:
             near_liquidity=self._nearest_liquidity(price, buf),
             hunt_summary=self._hunt_summary(),
         )
+
+
+# ---------------------------------------------------------------------------
+# PositionMonitor — tick-by-tick SL/TP checker for paper trading
+# ---------------------------------------------------------------------------
+
+
+class PositionMonitor:
+    """Monitors active paper positions against live ticks for SL/TP hits."""
+
+    def __init__(self, paper_broker: Any) -> None:
+        self._broker = paper_broker
+
+    def check_positions(self, current_price: float) -> list:
+        """Check all active positions for SL/TP hits.
+
+        Closes at the SL/TP price (not tick price) for realistic limit-order fills.
+        Returns list of ClosedTrade objects.
+        """
+        closed = []
+
+        # Iterate over a snapshot copy (list mutation safe)
+        for pos in list(self._broker.active_positions):
+            result = None
+            exit_price = 0.0
+
+            if pos.side == "buy":
+                if current_price >= pos.take_profit:
+                    result = "WIN"
+                    exit_price = pos.take_profit
+                elif current_price <= pos.stop_loss:
+                    result = "LOSS"
+                    exit_price = pos.stop_loss
+            else:  # sell / short
+                if current_price <= pos.take_profit:
+                    result = "WIN"
+                    exit_price = pos.take_profit
+                elif current_price >= pos.stop_loss:
+                    result = "LOSS"
+                    exit_price = pos.stop_loss
+
+            if result is not None:
+                ct = self._broker.close_position(pos, exit_price, result)
+                closed.append(ct)
+
+        return closed
+
+
+# ---------------------------------------------------------------------------
+# MarketRegime — macro trend detection (EMA 200 1H + ADX + 15m divergence)
+# ---------------------------------------------------------------------------
+
+
+def _compute_ema(closes: np.ndarray, period: int) -> float:
+    """Compute EMA over *closes* and return the latest value (numpy-only)."""
+    n = len(closes)
+    if n == 0:
+        return 0.0
+    if n < period:
+        return float(closes[-1])
+
+    k = 2.0 / (period + 1)
+    ema = float(np.mean(closes[:period]))  # seed with SMA
+    for i in range(period, n):
+        ema = float(closes[i]) * k + ema * (1.0 - k)
+    return ema
+
+
+def _compute_adx(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int = 14,
+) -> float:
+    """Compute ADX using Wilder's smoothing (numpy-only). Returns latest ADX or 0.0."""
+    n = len(closes)
+    if n < period + 1:
+        return 0.0
+
+    # True Range, +DM, -DM (vectorised)
+    prev_close = closes[:-1]
+    h = highs[1:]
+    l = lows[1:]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_close), np.abs(l - prev_close)))
+
+    up_move = highs[1:] - highs[:-1]
+    down_move = lows[:-1] - lows[1:]
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    # Wilder's smoothing: first value = sum of first *period* values,
+    # then running: prev - prev/period + current
+    def _wilder_smooth(arr: np.ndarray) -> np.ndarray:
+        out = np.empty(len(arr) - period + 1, dtype=np.float64)
+        out[0] = np.sum(arr[:period])
+        for i in range(1, len(out)):
+            out[i] = out[i - 1] - out[i - 1] / period + arr[period - 1 + i]
+        return out
+
+    if len(tr) < period:
+        return 0.0
+
+    atr_s = _wilder_smooth(tr)
+    plus_dm_s = _wilder_smooth(plus_dm)
+    minus_dm_s = _wilder_smooth(minus_dm)
+
+    # +DI, -DI
+    plus_di = 100.0 * plus_dm_s / np.where(atr_s == 0, 1.0, atr_s)
+    minus_di = 100.0 * minus_dm_s / np.where(atr_s == 0, 1.0, atr_s)
+
+    di_sum = plus_di + minus_di
+    dx = 100.0 * np.abs(plus_di - minus_di) / np.where(di_sum == 0, 1.0, di_sum)
+
+    if len(dx) < period:
+        return float(dx[-1]) if len(dx) > 0 else 0.0
+
+    # Smooth DX for ADX
+    adx_arr = _wilder_smooth(dx)
+    # Normalise: first Wilder smooth gives sums, divide by period for average
+    adx = adx_arr[-1] / period
+    return float(adx)
+
+
+class MarketRegime:
+    """Macro trend detection from 1H and 15m OHLCV candles."""
+
+    def __init__(self) -> None:
+        self._candles_1h: np.ndarray | None = None   # shape (N, 6)
+        self._candles_15m: np.ndarray | None = None
+
+        # Cached indicators (recomputed on load/update)
+        self.ema_200_1h: float = 0.0
+        self.adx_1h: float = 0.0
+        self.ema_50_15m: float = 0.0
+        self.current_price: float = 0.0
+        self.ready: bool = False
+
+    # -- properties --------------------------------------------------------
+
+    @property
+    def trend_1h(self) -> str:
+        """BULLISH if price > EMA 200, BEARISH if below, NEUTRAL if not computed."""
+        if self.ema_200_1h == 0.0:
+            return "NEUTRAL"
+        if self.current_price > self.ema_200_1h:
+            return "BULLISH"
+        return "BEARISH"
+
+    @property
+    def trend_strength(self) -> str:
+        """STRONG if ADX > 25, WEAK otherwise."""
+        return "STRONG" if self.adx_1h > 25 else "WEAK"
+
+    @property
+    def is_extreme_trend(self) -> bool:
+        """ADX > 50 — crash or melt-up in progress."""
+        return self.adx_1h > 50
+
+    # -- data loading ------------------------------------------------------
+
+    def _compute_indicators(self) -> None:
+        """Recompute all cached indicators from stored candles."""
+        if self._candles_1h is not None and len(self._candles_1h) > 0:
+            closes_1h = self._candles_1h[:, 4]  # close column
+            highs_1h = self._candles_1h[:, 2]
+            lows_1h = self._candles_1h[:, 3]
+            self.ema_200_1h = _compute_ema(closes_1h, 200)
+            self.adx_1h = _compute_adx(highs_1h, lows_1h, closes_1h, 14)
+            self.current_price = float(closes_1h[-1])
+
+        if self._candles_15m is not None and len(self._candles_15m) > 0:
+            closes_15m = self._candles_15m[:, 4]
+            self.ema_50_15m = _compute_ema(closes_15m, 50)
+
+    def load(self, ohlcv_1h: list[list], ohlcv_15m: list[list]) -> None:
+        """Initial load from ccxt fetch_ohlcv response."""
+        self._candles_1h = np.array(ohlcv_1h, dtype=np.float64)
+        self._candles_15m = np.array(ohlcv_15m, dtype=np.float64)
+        self._compute_indicators()
+        self.ready = True
+
+    def update(self, ohlcv_1h: list[list], ohlcv_15m: list[list]) -> None:
+        """Periodic refresh — same as load."""
+        self.load(ohlcv_1h, ohlcv_15m)
+
+    # -- signal filtering --------------------------------------------------
+
+    def is_signal_allowed(self, signal_side: str) -> bool:
+        """Core filter: should a signal of *signal_side* ('buy'/'sell') be taken?
+
+        - Not ready → allow all (graceful degradation)
+        - Extreme trend opposing signal → block (crash/melt-up protection)
+        - Buy: allow if BULLISH trend OR 15m price > EMA 50 (bullish divergence)
+        - Sell: allow if BEARISH trend OR 15m price < EMA 50 (bearish divergence)
+        """
+        if not self.ready:
+            return True
+
+        side = signal_side.lower()
+
+        # Extreme trend protection
+        if self.is_extreme_trend:
+            if side == "buy" and self.trend_1h == "BEARISH":
+                return False
+            if side == "sell" and self.trend_1h == "BULLISH":
+                return False
+
+        # Normal trend alignment + divergence check
+        if side == "buy":
+            if self.trend_1h == "BULLISH":
+                return True
+            # Allow if 15m shows bullish divergence
+            if self.ema_50_15m > 0 and self.current_price > self.ema_50_15m:
+                return True
+            return False
+
+        if side == "sell":
+            if self.trend_1h == "BEARISH":
+                return True
+            # Allow if 15m shows bearish divergence
+            if self.ema_50_15m > 0 and self.current_price < self.ema_50_15m:
+                return True
+            return False
+
+        return True  # unknown side — don't block
+
+    # -- dashboard ---------------------------------------------------------
+
+    @property
+    def action_label(self) -> str:
+        """Human-readable action string for the dashboard."""
+        if not self.ready:
+            return "WARMING UP (No Macro Data)"
+
+        trend = self.trend_1h
+        if trend == "NEUTRAL":
+            return "TAKING ALL SWEEPS"
+
+        if self.is_extreme_trend:
+            if trend == "BULLISH":
+                return "ONLY TAKING LONG SWEEPS (Bearish Sweeps Filtered — Extreme ADX)"
+            return "ONLY TAKING SHORT SWEEPS (Bullish Sweeps Filtered — Extreme ADX)"
+
+        if trend == "BULLISH":
+            return "FAVORING LONG SWEEPS (Bearish allowed on 15m divergence)"
+        return "FAVORING SHORT SWEEPS (Bullish allowed on 15m divergence)"
