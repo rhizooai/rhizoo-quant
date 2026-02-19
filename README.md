@@ -26,7 +26,7 @@ rhizoo-quant/
         ├── core/             # Exchange clients, risk management, telemetry, logging
         ├── strategies/       # Trading strategy implementations
         ├── data/             # Data processing, indicators, market regime
-        ├── services/         # Test tools (telemetry mock listener)
+        ├── services/         # Dashboard, test tools (telemetry mock listener)
         └── logs/             # Rotating logs + paper trade CSVs
 ```
 
@@ -40,6 +40,8 @@ rhizoo-quant/
 | [Loguru](https://github.com/Delgan/loguru) | `>=0.7.0` | Structured logging with colored console output + rotating file logs (10 MB, 7-day retention, gzip compression). |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | `>=1.0.0` | Two-layer `.env` loading — root credentials inherited by all bots, per-bot overrides take priority. |
 | [redis-py](https://github.com/redis/redis-py) | `>=5.0.0` | Async Pub/Sub telemetry bridge. Broadcasts real-time events (pulses, signals, trades) to external services. Optional — bot runs without it. |
+| [FastAPI](https://fastapi.tiangolo.com/) | `>=0.110.0` | Watch Window dashboard backend — subscribes to Redis telemetry and fans out events via WebSocket to browser clients. |
+| [TradingView Lightweight Charts](https://github.com/niceBBBBB/lightweight-charts) | CDN | Browser-side candlestick charting library. Renders 1-min candles, trade markers, and H1/H4 liquidity levels in real time. |
 
 ## Getting Started
 

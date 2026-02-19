@@ -204,6 +204,37 @@ python services/ui_mock.py
 
 The mock listener connects to the same Redis instance and prints color-coded JSON events as they arrive in real time.
 
+## Watch Window (Real-Time Dashboard)
+
+A browser-based charting dashboard that visualizes the bot's live state via TradingView Lightweight Charts. Connects to the same Redis telemetry stream and renders candlestick charts, trade markers, liquidity levels, and order flow metrics in real time.
+
+### Running the Dashboard
+
+```bash
+# Install dashboard dependencies (one time)
+pip install -r services/dashboard/requirements.txt
+
+# Start the dashboard server
+uvicorn services.dashboard.main:app --host 0.0.0.0 --port 8080
+```
+
+Open `http://localhost:8080` in your browser. The dashboard auto-connects to `BTC/USDT` — type a different symbol and click **Connect** to switch.
+
+### What It Shows
+
+- **Candlestick chart** — 1-minute candles built from live price ticks
+- **Trade markers** — Green arrows for buy entries, red arrows for sell entries, circles for exits
+- **H1/H4 liquidity levels** — Dashed price lines (orange for H4, blue for H1)
+- **Overlay HUD** — Price, nOFI (color-coded), trend direction, volume Z-Score, hunt status
+- **Event log** — Scrollable feed of signals and trade events with timestamps
+
+### Requirements
+
+The dashboard requires:
+1. **Redis running** — the bot must be broadcasting telemetry events
+2. **Bot running** — start the bot in a separate terminal (`python main.py`)
+3. Same `REDIS_*` environment variables as the bot
+
 ## Project Structure
 
 ```
@@ -223,7 +254,12 @@ rhizoo-alpha-bot/
 │   ├── base_strategy.py     # Abstract strategy interface
 │   └── liquidity_sweep.py   # Liquidity Sweep Hunter implementation
 ├── services/
-│   └── ui_mock.py           # Mock telemetry listener (test tool)
+│   ├── ui_mock.py           # Mock telemetry listener (test tool)
+│   └── dashboard/           # Real-time Watch Window
+│       ├── main.py          # FastAPI backend (Redis subscriber + WebSocket fan-out)
+│       ├── requirements.txt # Dashboard-specific dependencies
+│       └── static/
+│           └── index.html   # TradingView Lightweight Charts frontend
 └── logs/
     ├── alpha.log             # Rotating log file (10 MB, 7-day retention)
     └── simulated_trades_*.csv

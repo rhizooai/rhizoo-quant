@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rhizoo Watch Window</title>
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0e17;
+    color: #d1d4dc;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* --- Header bar --- */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px;
+    background: #131722;
+    border-bottom: 1px solid #363c4e;
+    flex-shrink: 0;
+  }
+
+  .header .logo {
+    font-size: 14px;
+    font-weight: 700;
+    color: #26a69a;
+    letter-spacing: 1.5px;
+  }
+
+  .header .pair-selector {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .header input {
+    background: #1e222d;
+    border: 1px solid #363c4e;
+    color: #d1d4dc;
+    padding: 6px 12px;
+    font-family: inherit;
+    font-size: 13px;
+    border-radius: 4px;
+    width: 160px;
+    text-transform: uppercase;
+  }
+
+  .header input:focus {
+    outline: none;
+    border-color: #26a69a;
+  }
+
+  .header button {
+    background: #26a69a;
+    color: #0a0e17;
+    border: none;
+    padding: 6px 16px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .header button:hover { background: #2bbd8f; }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ef5350;
+    margin-left: 12px;
+    transition: background 0.3s;
+  }
+
+  .status-dot.connected { background: #26a69a; }
+
+  /* --- Chart container --- */
+  .chart-container {
+    flex: 1;
+    position: relative;
+    min-height: 0;
+  }
+
+  #chart { width: 100%; height: 100%; }
+
+  /* --- Overlay HUD --- */
+  .overlay {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    background: rgba(19, 23, 34, 0.88);
+    border: 1px solid #363c4e;
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-size: 12px;
+    line-height: 1.7;
+    z-index: 10;
+    min-width: 200px;
+    pointer-events: none;
+  }
+
+  .overlay .label {
+    color: #787b86;
+    display: inline-block;
+    width: 70px;
+  }
+
+  .overlay .value { font-weight: 600; }
+  .overlay .bullish { color: #26a69a; }
+  .overlay .bearish { color: #ef5350; }
+  .overlay .neutral { color: #787b86; }
+
+  /* --- Level legend --- */
+  .level-legend {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: rgba(19, 23, 34, 0.88);
+    border: 1px solid #363c4e;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 11px;
+    line-height: 1.8;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  .level-legend .h4-color { color: #ff9800; }
+  .level-legend .h1-color { color: #42a5f5; }
+
+  /* --- Event log --- */
+  .event-log {
+    height: 120px;
+    overflow-y: auto;
+    background: #131722;
+    border-top: 1px solid #363c4e;
+    padding: 8px 16px;
+    font-size: 11px;
+    flex-shrink: 0;
+  }
+
+  .event-log .entry {
+    padding: 2px 0;
+    border-bottom: 1px solid #1e222d;
+  }
+
+  .event-log .ts { color: #787b86; }
+  .event-log .signal { color: #ab47bc; }
+  .event-log .trade-buy { color: #26a69a; }
+  .event-log .trade-sell { color: #ef5350; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="logo">RHIZOO WATCH WINDOW</div>
+  <div class="pair-selector">
+    <input type="text" id="symbolInput" value="BTC/USDT" placeholder="BTC/USDT">
+    <button id="connectBtn">Connect</button>
+    <div class="status-dot" id="statusDot"></div>
+  </div>
+</div>
+
+<!-- Chart area -->
+<div class="chart-container">
+  <div id="chart"></div>
+
+  <!-- Overlay HUD -->
+  <div class="overlay" id="overlay">
+    <div><span class="label">Price:</span> <span class="value" id="ov-price">—</span></div>
+    <div><span class="label">nOFI:</span> <span class="value" id="ov-nofi">—</span></div>
+    <div><span class="label">Trend:</span> <span class="value" id="ov-trend">—</span></div>
+    <div><span class="label">Volume:</span> <span class="value" id="ov-volume">—</span></div>
+    <div><span class="label">Status:</span> <span class="value" id="ov-hunt">—</span></div>
+  </div>
+
+  <!-- Level legend -->
+  <div class="level-legend" id="levelLegend">
+    <div><span class="h4-color">&#9644;</span> H4 High: <span id="lv-h4h">—</span></div>
+    <div><span class="h4-color">&#9644;</span> H4 Low: <span id="lv-h4l">—</span></div>
+    <div><span class="h1-color">&#9644;</span> H1 High: <span id="lv-h1h">—</span></div>
+    <div><span class="h1-color">&#9644;</span> H1 Low: <span id="lv-h1l">—</span></div>
+  </div>
+</div>
+
+<!-- Event log -->
+<div class="event-log" id="eventLog"></div>
+
+<script>
+// =========================================================================
+//  Rhizoo Watch Window — Client
+// =========================================================================
+
+const BG_COLOR   = '#131722';
+const GRID_COLOR = '#1e222d';
+const TEXT_COLOR = '#787b86';
+
+// --- Chart setup ---------------------------------------------------------
+
+const chartEl = document.getElementById('chart');
+const chart = LightweightCharts.createChart(chartEl, {
+  layout:     { background: { color: BG_COLOR }, textColor: TEXT_COLOR },
+  grid:       { vertLines: { color: GRID_COLOR }, horzLines: { color: GRID_COLOR } },
+  crosshair:  { mode: LightweightCharts.CrosshairMode.Normal },
+  rightPriceScale: { borderColor: '#363c4e' },
+  timeScale:  { borderColor: '#363c4e', timeVisible: true, secondsVisible: false },
+});
+
+const candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+  upColor:       '#26a69a',
+  downColor:     '#ef5350',
+  borderUpColor: '#26a69a',
+  borderDownColor: '#ef5350',
+  wickUpColor:   '#26a69a',
+  wickDownColor: '#ef5350',
+});
+
+// Resize on window change
+const ro = new ResizeObserver(() => {
+  chart.applyOptions({ width: chartEl.clientWidth, height: chartEl.clientHeight });
+});
+ro.observe(chartEl);
+
+// --- State ---------------------------------------------------------------
+
+let ws = null;
+let currentSymbol = 'BTC/USDT';
+let markers = [];
+let priceLines = { h4_high: null, h4_low: null, h1_high: null, h1_low: null };
+
+// Candle aggregation: we build 1-minute candles from price ticks
+let currentCandle = null;
+const CANDLE_INTERVAL = 60; // seconds
+
+function priceToCandle(price, ts) {
+  // ts is in milliseconds, convert to seconds and bucket to 1-min
+  const timeSec = Math.floor(ts / 1000);
+  const bucket = timeSec - (timeSec % CANDLE_INTERVAL);
+
+  if (!currentCandle || currentCandle.time !== bucket) {
+    // Finalize previous candle and start new
+    if (currentCandle) {
+      candleSeries.update(currentCandle);
+    }
+    currentCandle = { time: bucket, open: price, high: price, low: price, close: price };
+  } else {
+    currentCandle.high = Math.max(currentCandle.high, price);
+    currentCandle.low  = Math.min(currentCandle.low, price);
+    currentCandle.close = price;
+  }
+  candleSeries.update(currentCandle);
+}
+
+// --- Price lines (levels) -----------------------------------------------
+
+function updatePriceLine(key, price, title, color, side) {
+  if (priceLines[key]) {
+    candleSeries.removePriceLine(priceLines[key]);
+    priceLines[key] = null;
+  }
+  if (price > 0) {
+    priceLines[key] = candleSeries.createPriceLine({
+      price: price,
+      color: color,
+      lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: title,
+    });
+  }
+}
+
+// --- Markers (trade entry/exit) -----------------------------------------
+
+function addMarker(ts, price, side, action) {
+  const timeSec = Math.floor(ts / 1000);
+  const bucket = timeSec - (timeSec % CANDLE_INTERVAL);
+
+  const isBuy = side === 'buy';
+  const isEntry = action === 'ENTRY';
+
+  markers.push({
+    time: bucket,
+    position: isBuy ? 'belowBar' : 'aboveBar',
+    color: isBuy ? '#26a69a' : '#ef5350',
+    shape: isEntry ? (isBuy ? 'arrowUp' : 'arrowDown') : 'circle',
+    text: `${action} ${side.toUpperCase()}`,
+  });
+
+  // Sort markers by time (required by lightweight-charts)
+  markers.sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(markers);
+}
+
+// --- Overlay HUD --------------------------------------------------------
+
+function updateOverlay(data) {
+  const priceEl  = document.getElementById('ov-price');
+  const nofiEl   = document.getElementById('ov-nofi');
+  const trendEl  = document.getElementById('ov-trend');
+  const volEl    = document.getElementById('ov-volume');
+
+  if (data.price)          priceEl.textContent = Number(data.price).toLocaleString(undefined, { minimumFractionDigits: 2 });
+  if (data.nofi != null) {
+    const v = Number(data.nofi);
+    nofiEl.textContent = (v >= 0 ? '+' : '') + v.toFixed(4);
+    nofiEl.className = 'value ' + (v > 0.3 ? 'bullish' : v < -0.3 ? 'bearish' : 'neutral');
+  }
+  if (data.trend) {
+    trendEl.textContent = data.trend;
+    trendEl.className = 'value ' + (data.trend === 'BULLISH' ? 'bullish' : data.trend === 'BEARISH' ? 'bearish' : 'neutral');
+  }
+  if (data.volume_zscore != null) {
+    const z = Number(data.volume_zscore);
+    volEl.textContent = z.toFixed(1) + ' sigma';
+  }
+}
+
+function updateLevelLegend(data) {
+  document.getElementById('lv-h4h').textContent = data.h4_high > 0 ? Number(data.h4_high).toLocaleString() : '—';
+  document.getElementById('lv-h4l').textContent = data.h4_low  > 0 ? Number(data.h4_low).toLocaleString()  : '—';
+  document.getElementById('lv-h1h').textContent = data.h1_high > 0 ? Number(data.h1_high).toLocaleString() : '—';
+  document.getElementById('lv-h1l').textContent = data.h1_low  > 0 ? Number(data.h1_low).toLocaleString()  : '—';
+
+  document.getElementById('ov-hunt').textContent = data.hunt_summary || '—';
+}
+
+// --- Event log ----------------------------------------------------------
+
+function logEvent(type, text) {
+  const log = document.getElementById('eventLog');
+  const now = new Date().toLocaleTimeString();
+  let cls = '';
+  if (type === 'SIGNAL_GEN')  cls = 'signal';
+  if (type === 'TRADE_UPDATE') cls = text.includes('BUY') ? 'trade-buy' : 'trade-sell';
+
+  const entry = document.createElement('div');
+  entry.className = 'entry';
+  entry.innerHTML = `<span class="ts">${now}</span> <span class="${cls}">[${type}]</span> ${text}`;
+  log.prepend(entry);
+
+  // Keep last 100 entries
+  while (log.children.length > 100) log.removeChild(log.lastChild);
+}
+
+// --- WebSocket -----------------------------------------------------------
+
+function connect(symbol) {
+  if (ws) { ws.close(); ws = null; }
+
+  currentSymbol = symbol.toUpperCase();
+  const wsSymbol = currentSymbol.replace('/', '_');
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${protocol}://${window.location.host}/ws/${wsSymbol}`;
+
+  document.getElementById('statusDot').classList.remove('connected');
+  logEvent('SYSTEM', `Connecting to ${url} ...`);
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    document.getElementById('statusDot').classList.add('connected');
+    logEvent('SYSTEM', `Connected — watching ${currentSymbol}`);
+  };
+
+  ws.onclose = () => {
+    document.getElementById('statusDot').classList.remove('connected');
+    logEvent('SYSTEM', 'Disconnected — reconnecting in 3s');
+    setTimeout(() => connect(currentSymbol), 3000);
+  };
+
+  ws.onerror = () => {};
+
+  ws.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+
+    const event = msg.event;
+    const data  = msg.data || {};
+    const ts    = msg.timestamp_ms || Date.now();
+
+    if (event === 'HEARTBEAT') return;
+
+    if (event === 'MARKET_PULSE') {
+      if (data.price > 0) priceToCandle(data.price, ts);
+      updateOverlay(data);
+    }
+
+    if (event === 'LEVEL_UPDATE') {
+      updatePriceLine('h4_high', data.h4_high, 'H4 High', '#ff9800', 'high');
+      updatePriceLine('h4_low',  data.h4_low,  'H4 Low',  '#ff9800', 'low');
+      updatePriceLine('h1_high', data.h1_high, 'H1 High', '#42a5f5', 'high');
+      updatePriceLine('h1_low',  data.h1_low,  'H1 Low',  '#42a5f5', 'low');
+      updateLevelLegend(data);
+    }
+
+    if (event === 'SIGNAL_GEN') {
+      logEvent(event, `${data.side?.toUpperCase()} @ ${data.price} — ${data.reason}`);
+    }
+
+    if (event === 'TRADE_UPDATE') {
+      const action = data.action || '?';
+      const price = data.entry_price || data.exit_price || 0;
+      addMarker(ts, price, data.side, action);
+
+      if (action === 'ENTRY') {
+        logEvent(event, `${action} ${data.side?.toUpperCase()} @ ${price} | SL=${data.stop_loss} TP=${data.take_profit}`);
+      } else {
+        logEvent(event, `${action} ${data.side?.toUpperCase()} @ ${price} | PnL=${data.pnl} ${data.result}`);
+      }
+    }
+  };
+}
+
+// --- Init ----------------------------------------------------------------
+
+document.getElementById('connectBtn').addEventListener('click', () => {
+  const sym = document.getElementById('symbolInput').value.trim();
+  if (sym) connect(sym);
+});
+
+document.getElementById('symbolInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('connectBtn').click();
+});
+
+// Auto-connect on load
+connect(document.getElementById('symbolInput').value);
+</script>
+</body>
+</html>
