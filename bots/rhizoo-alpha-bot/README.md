@@ -152,6 +152,58 @@ Win Rate:         66.7%
 ...
 ```
 
+## Telemetry (Redis Pub/Sub)
+
+The bot includes an optional telemetry bridge that broadcasts real-time events to a Redis Pub/Sub channel (`rhizoo_telemetry`). External services — dashboards, alerting systems, or custom UIs — can subscribe to receive live state.
+
+### Event Types
+
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `MARKET_PULSE` | Every 5s pulse | symbol, nOFI, volume Z-Score, efficiency, trend, price, ATR |
+| `LEVEL_UPDATE` | Every 5s pulse | H1/H4 highs and lows, near liquidity, hunt summary |
+| `SIGNAL_GEN` | Strategy finds a setup | side, strength, price, SL, TP, reason |
+| `TRADE_UPDATE` | Paper entry or exit | action (ENTRY/EXIT), id, pair, side, prices, PnL |
+
+### Setup
+
+Telemetry is **fire-and-forget** — if Redis is not available, the bot logs a warning and continues trading normally.
+
+**Local Redis:**
+
+```bash
+# Ubuntu/Debian
+sudo apt install redis-server && redis-server
+
+# macOS
+brew install redis && redis-server
+```
+
+**Hosted Redis (Upstash, Redis Cloud, etc.):**
+
+```env
+REDIS_HOST=your-host.upstash.io
+REDIS_PORT=6380
+REDIS_PASSWORD=your_auth_token
+REDIS_SSL=true
+```
+
+### Testing with the Mock Listener
+
+A test script is included to verify the telemetry pipeline:
+
+```bash
+# Terminal 1: run the bot
+source .venv/bin/activate
+python main.py
+
+# Terminal 2: subscribe to events
+source .venv/bin/activate
+python services/ui_mock.py
+```
+
+The mock listener connects to the same Redis instance and prints color-coded JSON events as they arrive in real time.
+
 ## Project Structure
 
 ```
@@ -163,12 +215,15 @@ rhizoo-alpha-bot/
 │   ├── exchange_client.py   # ccxt.pro WebSocket client + REST methods
 │   ├── risk_manager.py      # Gatekeeper: sizing, circuit breakers, spread guard
 │   ├── paper_broker.py      # Virtual execution engine + CSV logging
+│   ├── telemetry.py         # Redis Pub/Sub event broadcaster
 │   └── logger.py            # Loguru configuration (console + file rotation)
 ├── data/
 │   └── processor.py         # ImbalanceTracker, LevelTracker, MarketRegime
 ├── strategies/
 │   ├── base_strategy.py     # Abstract strategy interface
 │   └── liquidity_sweep.py   # Liquidity Sweep Hunter implementation
+├── services/
+│   └── ui_mock.py           # Mock telemetry listener (test tool)
 └── logs/
     ├── alpha.log             # Rotating log file (10 MB, 7-day retention)
     └── simulated_trades_*.csv
@@ -185,6 +240,10 @@ rhizoo-alpha-bot/
 | `PAPER_TRADING` | `false` | Enable simulated execution (`true` / `false`) |
 | `PAPER_BALANCE` | `10000.0` | Virtual starting balance for paper trades |
 | `LOG_LEVEL` | `DEBUG` | Logging verbosity |
+| `REDIS_HOST` | `localhost` | Redis hostname for telemetry |
+| `REDIS_PORT` | `6379` | Redis port |
+| `REDIS_PASSWORD` | — | Redis auth password (leave empty for local) |
+| `REDIS_SSL` | `false` | Enable TLS for hosted Redis (`true` / `false`) |
 
 See the root [`.env.example`](../../.env.example) for the full configuration reference and instructions on the two-layer `.env` system.
 

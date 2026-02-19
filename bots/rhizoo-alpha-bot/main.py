@@ -23,6 +23,7 @@ import time
 from core.logger import logger
 from core.exchange_client import ExchangeClient, ExchangeConfig
 from core.risk_manager import RiskManager
+from core.telemetry import TelemetryClient
 from data.processor import ImbalanceTracker, LevelInfo, MarketMetrics, MarketRegime
 from strategies.liquidity_sweep import LiquiditySweepStrategy
 
@@ -175,10 +176,12 @@ async def _refresh_regime(
 async def run(symbol: str) -> None:
     """Long-running coroutine: streams trades, computes metrics, drives strategy."""
     client = ExchangeClient(ExchangeConfig(sandbox=True))
+    telemetry = TelemetryClient()
     refresh_task = None
     paper_broker = None
 
     try:
+        await telemetry.connect()
         symbol = await client.validate_symbol(symbol)
         risk = RiskManager()
         tracker = ImbalanceTracker()
@@ -226,9 +229,29 @@ async def run(symbol: str) -> None:
                 for ct in closed:
                     _print_exit_ticket(ct)
                     risk.record_fill(ct.pnl)
+                    await telemetry.broadcast_event("TRADE_UPDATE", {
+                        "action": "EXIT",
+                        "id": ct.id,
+                        "pair": ct.pair,
+                        "side": ct.side,
+                        "entry_price": ct.entry_price,
+                        "exit_price": ct.exit_price,
+                        "pnl": ct.pnl,
+                        "result": ct.result,
+                    })
 
             # Strategy → Signal → Regime Override → RiskManager → ValidatedOrder
             trade_signal = await strategy.generate_signal(metrics)
+
+            if trade_signal:
+                await telemetry.broadcast_event("SIGNAL_GEN", {
+                    "side": trade_signal.side,
+                    "strength": trade_signal.strength,
+                    "price": trade_signal.price,
+                    "stop_loss": trade_signal.stop_loss,
+                    "take_profit": trade_signal.take_profit,
+                    "reason": trade_signal.reason,
+                })
 
             # Second gate: extreme-trend override (catches edge cases)
             if trade_signal and regime.ready and regime.is_extreme_trend:
@@ -249,6 +272,16 @@ async def run(symbol: str) -> None:
                         else:
                             position = paper_broker.execute_order(order)
                             _print_entry_ticket(position)
+                            await telemetry.broadcast_event("TRADE_UPDATE", {
+                                "action": "ENTRY",
+                                "id": position.id,
+                                "pair": position.pair,
+                                "side": position.side,
+                                "entry_price": position.entry_price,
+                                "stop_loss": position.stop_loss,
+                                "take_profit": position.take_profit,
+                                "position_size": position.position_size,
+                            })
                     else:
                         await strategy.execute(order)
                 else:
@@ -264,6 +297,27 @@ async def run(symbol: str) -> None:
                     _print_paper_stats(paper_broker.get_stats())
                 last_pulse = now
 
+                # Telemetry broadcasts
+                await telemetry.broadcast_event("MARKET_PULSE", {
+                    "symbol": symbol,
+                    "nofi": metrics.nofi,
+                    "volume_zscore": metrics.volume_zscore,
+                    "efficiency": metrics.efficiency,
+                    "trend": metrics.trend,
+                    "is_absorption": metrics.is_absorption,
+                    "price": level_info.current_price,
+                    "atr": level_info.atr,
+                })
+                await telemetry.broadcast_event("LEVEL_UPDATE", {
+                    "symbol": symbol,
+                    "h1_high": level_info.h1_high,
+                    "h1_low": level_info.h1_low,
+                    "h4_high": level_info.h4_high,
+                    "h4_low": level_info.h4_low,
+                    "near_liquidity": level_info.near_liquidity,
+                    "hunt_summary": level_info.hunt_summary,
+                })
+
     except asyncio.CancelledError:
         logger.info("Run loop cancelled — shutting down")
     finally:
@@ -276,6 +330,7 @@ async def run(symbol: str) -> None:
         if PAPER_TRADING and paper_broker is not None:
             logger.info("=== FINAL PAPER TRADING STATS ===")
             _print_paper_stats(paper_broker.get_stats())
+        await telemetry.close()
         await client.close()
 
 

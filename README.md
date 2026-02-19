@@ -23,9 +23,10 @@ rhizoo-quant/
         ├── README.md         # Bot-specific documentation
         ├── requirements.txt
         ├── setup.sh          # One-command environment setup
-        ├── core/             # Exchange clients, risk management, logging
+        ├── core/             # Exchange clients, risk management, telemetry, logging
         ├── strategies/       # Trading strategy implementations
         ├── data/             # Data processing, indicators, market regime
+        ├── services/         # Test tools (telemetry mock listener)
         └── logs/             # Rotating logs + paper trade CSVs
 ```
 
@@ -38,6 +39,7 @@ rhizoo-quant/
 | [Pydantic](https://docs.pydantic.dev/) | `>=2.0.0` | Data validation and settings management. Every config, metric, signal, and order is a typed Pydantic model. |
 | [Loguru](https://github.com/Delgan/loguru) | `>=0.7.0` | Structured logging with colored console output + rotating file logs (10 MB, 7-day retention, gzip compression). |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | `>=1.0.0` | Two-layer `.env` loading — root credentials inherited by all bots, per-bot overrides take priority. |
+| [redis-py](https://github.com/redis/redis-py) | `>=5.0.0` | Async Pub/Sub telemetry bridge. Broadcasts real-time events (pulses, signals, trades) to external services. Optional — bot runs without it. |
 
 ## Getting Started
 
@@ -97,6 +99,10 @@ The repo uses a **two-layer `.env` system**:
 | `ZSCORE_THRESHOLD` | `2.0` | Bot | Volume Z-Score signal threshold |
 | `PAPER_TRADING` | `true` | Bot | Enable simulated execution |
 | `PAPER_BALANCE` | `10000.0` | Bot | Virtual starting balance |
+| `REDIS_HOST` | `localhost` | Root | Redis hostname for telemetry |
+| `REDIS_PORT` | `6379` | Root | Redis port |
+| `REDIS_PASSWORD` | — | Root | Redis auth password |
+| `REDIS_SSL` | `false` | Root | Enable TLS for hosted Redis |
 
 ## Execution Flow
 
@@ -112,10 +118,12 @@ main.py → run(symbol)
        ├─ LevelTracker.push_trade()      ← Candle synthesis, H1/H4 levels, ATR
        ├─ Strategy.generate_signal()     ← Hunter state machine + regime filter
        ├─ RiskManager.process_signal()   ← Sizing, circuit breakers, spread guard
-       └─ Execute (paper or live)
+       ├─ Execute (paper or live)
+       └─ TelemetryClient.broadcast()  ← Pub/Sub events to Redis (optional)
 ```
 
 ## Requirements
 
 - Python 3.11+
 - Exchange API credentials (Binance testnet supported via sandbox mode)
+- Redis (optional, for telemetry) — [install locally](https://redis.io/docs/getting-started/) or use a hosted provider like [Upstash](https://upstash.com/), [Redis Cloud](https://redis.io/cloud/), or AWS ElastiCache
